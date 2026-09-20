@@ -147,7 +147,7 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
         use_mm_prefix: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
-        if device_capability.major == 10:
+        if device_capability.major in (10, 11):
             if kv_cache_dtype == "fp8_ds_mla":
                 return (
                     "FLASHINFER_MLA_SPARSE_DSV4 SM10x uses the plain "
