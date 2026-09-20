@@ -721,6 +721,7 @@ class CudaPlatformBase(Platform):
         return (
             cls.is_device_capability(90)
             or cls.is_device_capability_family(100)
+            or cls.is_device_capability_family(110)
             or cls.is_device_capability_family(120)
         )
 
