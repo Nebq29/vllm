@@ -170,6 +170,13 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         As: torch.Tensor,
         Bs: torch.Tensor,
     ) -> torch.Tensor:
+        # [THOR-OVERLAY] e8m0 scale widening
+        # Triton 3.7.1 cannot canonicalise torch.float8_e8m0fnu. e8m0 is a
+        # power-of-two scale, so widening to float32 is exact.
+        if getattr(As, "dtype", None) == torch.float8_e8m0fnu:
+            As = As.to(torch.float32)
+        if getattr(Bs, "dtype", None) == torch.float8_e8m0fnu:
+            Bs = Bs.to(torch.float32)
         return torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
             A,
             B,
