@@ -110,6 +110,28 @@ def _deepseek_v4_sm110_fp8_einsum_kernel(
     )
 
 
+def _unpack_packed_ue8m0_to_fp32(sf: torch.Tensor) -> torch.Tensor:
+    """Unpack DeepGEMM packed UE8M0 int32 scales back to FP32.
+
+    Inverse of ``get_mn_major_tma_aligned_packed_ue8m0_tensor``: the packed
+    tensor is int32 ``(g, mn, k/4)`` with transposed storage
+    (strides ``(pk*tma_mn, 1, tma_mn)``), each int32 holding 4 little-endian
+    UE8M0 exponent bytes along K. Returns ``(g, mn, k/128)`` float32 with the
+    logical (group, mn, k_block) ordering the Triton einsum kernel expects.
+    """
+    assert sf.dtype == torch.int32
+    g, mn, pk = sf.shape
+    # The packed tensor has transposed storage; materialize standard layout so
+    # the dtype view below sees the logical (g, mn, pk) element order.
+    as_u8 = sf.contiguous().view(torch.uint8)
+    # Exponent byte -> float32: << 23.
+    f32 = (as_u8.to(torch.int32) << 23).view(torch.float32)
+    # f32 shape: (g, mn, pk*4) = (g, out_rank, hidden/128). The packing
+    # broadcast each 128-row block scale to every row (gran_mn=128), so
+    # reduce back to one scale per block: (g, out_rank/128, hidden/128).
+    return f32[:, ::128, :]
+
+
 def deepseek_v4_sm110_fp8_einsum(
     a: torch.Tensor,
     a_scale: torch.Tensor,
@@ -130,7 +152,11 @@ def deepseek_v4_sm110_fp8_einsum(
     e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
     if a_scale.dtype == e8m0_dtype:
         a_scale = _upcast_e8m0_to_fp32(a_scale)
-    if b_scale.dtype == e8m0_dtype:
+    if b_scale.dtype == torch.int32:
+        # --linear-backend deep_gemm packs wo_a scales to packed UE8M0 int32
+        # at load; unpack back to the FP32 block scales this kernel wants.
+        b_scale = _unpack_packed_ue8m0_to_fp32(b_scale)
+    elif b_scale.dtype == e8m0_dtype:
         b_scale = _upcast_e8m0_to_fp32(b_scale)
     assert a_scale.dtype == torch.float32
     assert b_scale.dtype == torch.float32
@@ -203,7 +229,12 @@ def _use_deepseek_v4_sm110_triton_fp8_einsum(
         and capability.minor == 0
         and equation == "bhr,hdr->bhd"
         and tuple(recipe) == (1, 128, 128)
-        and b_scale.dtype in (torch.float32, e8m0_dtype)
+        and b_scale.dtype
+        in (
+            torch.float32,
+            e8m0_dtype,
+            torch.int32,  # packed UE8M0 from --linear-backend deep_gemm
+        )
     )
 
 
@@ -280,7 +311,28 @@ def deepseek_v4_fp8_einsum(
                 b_scale = b_scale.narrow(0, group_start, num_groups)
 
         if _use_deepseek_v4_sm110_triton_fp8_einsum(equation, recipe, b_scale):
+            import os as _os
+            if _os.environ.get("DG_EINSUM_DEBUG") and not getattr(
+                deepseek_v4_fp8_einsum, "_dbg_done", False
+            ):
+                deepseek_v4_fp8_einsum._dbg_done = True
+                print(
+                    f"[einsum-BYPASS] eq={equation!r} recipe={tuple(recipe)} "
+                    f"a.shape={tuple(a.shape)} a_scale.dtype={a_scale.dtype} "
+                    f"a_scale.shape={tuple(a_scale.shape)} "
+                    f"b.shape={tuple(b.shape)} b_scale.dtype={b_scale.dtype} "
+                    f"b_scale.shape={tuple(b_scale.shape)} b_scale.stride={b_scale.stride()} "
+                    f"out.shape={tuple(out.shape)}",
+                    flush=True,
+                )
             deepseek_v4_sm110_fp8_einsum(a, a_scale, b, b_scale, out)
             return
 
-    fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
+        import os as _os
+        if _os.environ.get("DG_EINSUM_DEBUG"):
+            cap = current_platform.get_device_capability()
+            print(f"[einsum-fallthrough] cap={cap} eq={equation!r} recipe={tuple(recipe)} "
+                  f"b_scale.dtype={b_scale.dtype} b_scale.shape={tuple(b_scale.shape)} "
+                  f"a_scale.dtype={a_scale.dtype} b.dim={b.dim()} b.shape={tuple(b.shape)}",
+                  flush=True)
+        fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
