@@ -446,6 +446,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
 
         return is_deep_gemm_supported() and (
             current_platform.is_device_capability_family(100)
+            or current_platform.is_device_capability_family(110)
             or current_platform.is_device_capability_family(120)
         )
 
