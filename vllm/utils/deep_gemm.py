@@ -45,6 +45,7 @@ def should_auto_disable_deep_gemm(model_type: str | None) -> bool:
         return False
     if not (
         current_platform.is_device_capability_family(100)
+        or current_platform.is_device_capability_family(110)
         or current_platform.is_device_capability_family(120)
     ):
         return False
@@ -82,6 +83,7 @@ class DeepGemmQuantScaleFMT(Enum):
             cls.UE8M0
             if (
                 current_platform.is_device_capability_family(100)
+                or current_platform.is_device_capability_family(110)
                 or current_platform.is_device_capability_family(120)
             )
             else cls.FLOAT32_CEIL_UE8M0
