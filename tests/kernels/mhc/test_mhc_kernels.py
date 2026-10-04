@@ -12,6 +12,7 @@ import vllm.model_executor.layers.mhc as mhc_layers
 from vllm.model_executor.kernels.mhc.tilelang import (
     _torch_hc_prenorm_gemm,
     mhc_post_tilelang,
+    mhc_pre_broadcast_tilelang,
     mhc_pre_delayed_tilelang,
 )
 from vllm.model_executor.kernels.mhc.tilelang_kernels import (
@@ -1044,6 +1045,69 @@ def test_hc_prenorm_gemm_tilelang(num_tokens, hidden_size):
 
     torch.testing.assert_close(out, out_ref, atol=1e-5, rtol=1e-4)
     torch.testing.assert_close(sqrsum, sqrsum_ref, atol=1e-2, rtol=1e-6)
+
+
+@pytest.mark.skipif(
+    not HAS_TILELANG_MHC,
+    reason="TileLang MHC support required",
+)
+@pytest.mark.parametrize("num_tokens", [1, 128])
+def test_mhc_pre_broadcast_tilelang_without_deepgemm(num_tokens, monkeypatch):
+    """Thor (SM110) has no DeepGEMM: the broadcast pre path must work alone."""
+    torch.set_default_device(DEVICE)
+    set_random_seed(0)
+    monkeypatch.setattr(
+        "vllm.utils.deep_gemm.is_deep_gemm_supported",
+        lambda: False,
+    )
+
+    hidden_size = 4096
+    hc_mult = 4
+    hc_mult3 = hc_mult * (2 + hc_mult)
+    residual = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16)
+    fn = torch.randn((hc_mult3, hc_mult * hidden_size), dtype=torch.float32) * 1e-4
+    fn_broadcast = fn.view(hc_mult3, hc_mult, hidden_size).sum(dim=1)
+    hc_scale = torch.randn((3,), dtype=torch.float32) * 0.1
+    hc_base = torch.randn((hc_mult3,), dtype=torch.float32) * 0.1
+    norm_weight = torch.randn((hidden_size,), dtype=torch.bfloat16)
+
+    residual_out, post_mix, res_mix, layer_input = mhc_pre_broadcast_tilelang(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        1e-6,
+        1e-6,
+        1e-6,
+        1.0,
+        20,
+        norm_weight=norm_weight,
+        fn_broadcast=fn_broadcast,
+    )
+
+    residual_ref = residual.unsqueeze(1).expand(-1, hc_mult, -1)
+    post_mix_ref, res_mix_ref, layer_input_ref = mhc_pre_ref(
+        residual_ref,
+        fn,
+        hc_scale,
+        hc_base,
+        1e-6,
+        1e-6,
+        1e-6,
+        1.0,
+        20,
+    )
+    layer_input_ref = torch.nn.functional.rms_norm(
+        layer_input_ref.float(),
+        (hidden_size,),
+        norm_weight.float(),
+        eps=1e-6,
+    ).bfloat16()
+
+    torch.testing.assert_close(residual_out, residual_ref)
+    torch.testing.assert_close(post_mix, post_mix_ref, atol=5e-2, rtol=1e-2)
+    torch.testing.assert_close(res_mix, res_mix_ref, atol=5e-2, rtol=1e-2)
+    torch.testing.assert_close(layer_input, layer_input_ref, atol=5e-2, rtol=1e-2)
 
 
 @pytest.mark.skipif(
