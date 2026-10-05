@@ -353,7 +353,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         GPUs (SM100 datacenter and SM120 consumer).
         """
         return is_deep_gemm_e8m0_used() and (
-            current_platform.is_device_capability_family(100)
+            current_platform.is_sm100_class()
             or current_platform.is_device_capability_family(120)
         )
 

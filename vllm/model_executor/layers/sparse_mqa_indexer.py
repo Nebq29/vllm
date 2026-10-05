@@ -98,7 +98,7 @@ class SparseMQAIndexer(nn.Module):
         super().__init__()
         if not (
             current_platform.is_cuda()
-            and current_platform.is_device_capability_family(100)
+            and current_platform.is_sm100_class()
             and has_deep_gemm_sparse_mqa()
         ):
             raise ValueError(

@@ -31,7 +31,7 @@ class DeepGemmMxfp8BmmLinearKernel(Mxfp8LinearKernel):
     ) -> tuple[bool, str | None]:
         if not current_platform.is_cuda() or not is_deep_gemm_supported():
             return False, "DeepGEMM BMM requires a supported CUDA device."
-        if not current_platform.is_device_capability_family(100):
+        if not current_platform.is_sm100_class():
             return False, "DeepGEMM MXFP8 BMM requires Blackwell."
         return True, None
 

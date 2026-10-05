@@ -184,7 +184,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         # MXFP8 1x32 uses the fp8_fp4 grouped GEMM with recipe (1, 32) — only
         # available on Blackwell (SM100).
         if (weight_key, activation_key) == (kMxfp8Static, kMxfp8Dynamic):
-            return current_platform.is_device_capability_family(100)
+            return current_platform.is_sm100_class()
         return False
 
     @staticmethod

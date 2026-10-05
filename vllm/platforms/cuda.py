@@ -716,6 +716,17 @@ class CudaPlatformBase(Platform):
         )
 
     @classmethod
+    def is_sm100_class(cls) -> bool:
+        """True on SM100 (B200) and SM110 (Jetson Thor).
+
+        Use ONLY where the gated code runs DeepGEMM kernels (JIT-compiled for
+        sm_110f on Thor). Do NOT use for precompiled SM100a binaries
+        (FlashInfer, FlashMLA, TRT-LLM, CuTe-DSL, CUTLASS, vllm-flash-attn)
+        — those do not contain sm_110 code.
+        """
+        return cls.is_device_capability_family(100) or cls.is_device_capability_family(110)
+
+    @classmethod
     def is_integrated_gpu(cls, device_id: int = 0) -> bool:
         return bool(torch.cuda.get_device_properties(device_id).is_integrated)
 

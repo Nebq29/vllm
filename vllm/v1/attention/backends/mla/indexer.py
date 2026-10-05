@@ -86,7 +86,7 @@ def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
                 "aiter with VLLM_ROCM_USE_AITER=1."
             )
         return True
-    if use_fp4 and not current_platform.is_device_capability_family(100):
+    if use_fp4 and not current_platform.is_sm100_class():
         raise ValueError(
             "indexer_kv_dtype='mxfp4' requires Blackwell datacenter GPUs "
             "(sm_10x, e.g. B200/GB200); sm_120 (consumer Blackwell) and "
@@ -843,7 +843,7 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
 def _supports_varlen_paged_mqa_logits() -> bool:
     return (
         current_platform.is_cuda()
-        and current_platform.is_device_capability_family(100)
+        and current_platform.is_sm100_class()
         and is_deep_gemm_supported()
     )
 
@@ -872,7 +872,7 @@ def _supports_native_decode(next_n: int) -> bool:
     """
     if not (current_platform.is_cuda() and is_deep_gemm_supported()):
         return next_n in (1, 2)
-    if current_platform.is_device_capability_family(100):
+    if current_platform.is_sm100_class():
         return True
     if current_platform.is_device_capability_family(90):
         return native_next_n_supported(next_n)

@@ -115,7 +115,7 @@ class DeepseekV41SparseIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder)
             )
         if not (
             current_platform.is_cuda()
-            and current_platform.is_device_capability_family(100)
+            and current_platform.is_sm100_class()
         ):
             raise ValueError(f"{prefix} requires an SM100-class GPU.")
         if not has_deep_gemm_sparse_mqa():
