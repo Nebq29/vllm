@@ -107,6 +107,11 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     THOR_MLA_SPARSE_DSV4 = (
         "vllm.models.deepseek_v4.nvidia.thor.DeepseekV4ThorSparseBackend"
     )
+    # GLM-5.3 sparse MLA on Thor (SM110): rope-free BF16 via the portable
+    # Triton kernels (no sm_110 precompiled sparse-MLA lib exists).
+    THOR_MLA_SPARSE_GLM = (
+        "vllm.models.glm5next.nvidia.thor_sparse.ThorMLASparseGLMBackend"
+    )
     # DeepSeek V4.1 sparse MLA backends (model-driven; selected via the V4.1
     # layer). Separate names from DSV4 so a V4.1 model never resolves the
     # V4.0 backend classes through this enum.
