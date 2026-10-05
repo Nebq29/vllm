@@ -282,7 +282,11 @@ class Indexer(nn.Module):
             disable_tp=True,
             prefix=f"{prefix}.wk_weights_proj",
         )
-        self.k_norm = LayerNorm(self.head_dim, eps=1e-6, dtype=torch.float32)
+        # NOTE: constructed without `dtype=` for compatibility with older
+        # vllm.layernorm.LayerNorm signatures (bind-mount seam), then cast to
+        # fp32 to match the checkpoint's fp32 norm weights.
+        self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
+        self.k_norm.float()
         self.softmax_scale = self.head_dim**-0.5
 
         # Hadamard-128 rotation of the indexer query is fused with the FP8
@@ -393,7 +397,11 @@ class Indexer(nn.Module):
         # when this file is bind-mounted over an image whose envs.py predates the
         # fork's entry (vllm.envs.__getattr__ raises on unknown names).
         _legacy_fp8 = os.getenv("VLLM_GLM_INDEXER_LEGACY_FP8", "0") == "1"
-        mx_sf = current_platform.is_sm100_class() and not _legacy_fp8
+        # Direct capability check: SM100 (B200) and SM110 (Jetson Thor).
+        # Avoids current_platform.is_sm100_class(), which the older
+        # thor-dsv4 image's platform proxy resolves to None.
+        _cc = torch.cuda.get_device_capability()
+        mx_sf = _cc[0] in (10, 11) and not _legacy_fp8
         q = q.view(-1, self.head_dim)
         if mx_sf:
             q_fp8, q_sf = fwht128_quant_fp8_mx(q)

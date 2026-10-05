@@ -150,8 +150,12 @@ class SparseIndexerTopk(torch.nn.Module):
     def __init__(self, backend: str | None = None) -> None:
         super().__init__()
         if backend is None:
-            backend = (
-                get_current_vllm_config().kernel_config.sparse_indexer_topk_backend
+            # getattr default for older vllm KernelConfig without this field
+            # (bind-mount seam against the thor-dsv4 image).
+            backend = getattr(
+                get_current_vllm_config().kernel_config,
+                "sparse_indexer_topk_backend",
+                "auto",
             )
         self._backend = backend
         self._is_cuda = current_platform.is_cuda()

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -343,6 +345,10 @@ def sparse_attn_indexer_kpool(
                 chunk.cu_seqlen_ke,
                 clean_logits=False,
             )
+            if mx_sf and logits.dtype != torch.float32:
+                # DeepGEMM returns bf16 logits on SM100/110; the top-k
+                # kernels here are fp32-only.
+                logits = logits.float()
             num_rows = logits.shape[0]
 
             # kpool: logits are pool-granular (compress_ratio == index_kpool),
@@ -597,6 +603,10 @@ def sparse_attn_indexer_kpool(
             clean_logits=False,
             indices=decode_metadata.indices,
         )
+        if mx_sf and logits.dtype != torch.float32:
+            # DeepGEMM returns bf16 logits on SM100/110; the top-k
+            # kernels here are fp32-only.
+            logits = logits.float()
         num_rows = logits.shape[0]
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
         # then expand each pool back to its kpool tokens.
@@ -700,10 +710,16 @@ class SparseAttnIndexerKpool(CustomOp):
                 "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
             )
         _cfg = get_current_vllm_config_or_none()
+        # getattr default for older vllm KernelConfig without this field
+        # (bind-mount seam against the thor-dsv4 image). Env override picks
+        # the backend without a config rebuild: cooperative top-k uses CUDA
+        # thread-block clusters that fail to launch on Thor (sm_110), so
+        # GLM runs set VLLM_GLM_INDEXER_TOPK_BACKEND=persistent.
+        _default_topk = os.getenv("VLLM_GLM_INDEXER_TOPK_BACKEND", "auto")
         self.topk_backend = (
-            _cfg.kernel_config.sparse_indexer_topk_backend
+            getattr(_cfg.kernel_config, "sparse_indexer_topk_backend", _default_topk)
             if _cfg is not None
-            else "auto"
+            else _default_topk
         )
         _parallel = _cfg.parallel_config if _cfg is not None else None
         if (
