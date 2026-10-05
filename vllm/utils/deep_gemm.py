@@ -159,6 +159,9 @@ _grouped_masked_impl: Callable[..., Any] | None = None
 _grouped_fp4_impl: Callable[..., Any] | None = None
 _fp8_fp4_mqa_logits_impl: Callable[..., Any] | None = None
 _fp8_fp4_paged_mqa_logits_impl: Callable[..., Any] | None = None
+# True when the installed DeepGEMM's MQA-logits APIs take `clean_logits`
+# (pre-2.8 wheels). Probed in _lazy_init(); 2.8+ dropped the parameter.
+_dg_has_clean_logits: bool = True
 _get_paged_mqa_logits_metadata_impl: Callable[..., Any] | None = None
 _fp8_fp4_sparse_mqa_logits_impl: Callable[..., Any] | None = None
 _fp8_fp4_paged_sparse_mqa_logits_impl: Callable[..., Any] | None = None
@@ -304,6 +307,15 @@ def _lazy_init() -> None:
     # handle both the FP8 and FP4 Q/K paths via a tuple-typed `q`.
     _fp8_fp4_mqa_logits_impl = getattr(_dg, "fp8_fp4_mqa_logits", None)
     _fp8_fp4_paged_mqa_logits_impl = getattr(_dg, "fp8_fp4_paged_mqa_logits", None)
+    # DeepGEMM 2.8+ (Thor wheel) dropped the `clean_logits` parameter from
+    # both MQA-logits APIs and added a required `max_seqlen_k` to the
+    # contiguous variant. pybind exposes no inspect.signature, but the
+    # generated docstring lists the named parameters — probe it once.
+    global _dg_has_clean_logits
+    _dg_has_clean_logits = (
+        _fp8_fp4_mqa_logits_impl is not None
+        and "clean_logits" in (_fp8_fp4_mqa_logits_impl.__doc__ or "")
+    )
     _get_paged_mqa_logits_metadata_impl = getattr(
         _dg, "get_paged_mqa_logits_metadata", None
     )
@@ -628,13 +640,25 @@ def fp8_fp4_mqa_logits(
     _lazy_init()
     if _fp8_fp4_mqa_logits_impl is None:
         return _missing()
+    if _dg_has_clean_logits:
+        return _fp8_fp4_mqa_logits_impl(
+            q,
+            kv,
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            clean_logits=clean_logits,
+        )
+    # DeepGEMM 2.8+: `clean_logits` dropped, `max_seqlen_k` required.
+    # The gathered KV length is a safe upper bound (matches the old
+    # full-width output shape).
     return _fp8_fp4_mqa_logits_impl(
         q,
         kv,
         weights,
         cu_seqlen_ks,
         cu_seqlen_ke,
-        clean_logits=clean_logits,
+        kv[0].shape[0],
     )
 
 
@@ -744,6 +768,8 @@ def fp8_fp4_paged_mqa_logits(
     if block_tables.dim() >= 2 and block_tables.stride(-1) != 1:
         block_tables = block_tables.clone(memory_format=torch.contiguous_format)
     kwargs = {} if indices is None else {"indices": indices}
+    if _dg_has_clean_logits:
+        kwargs["clean_logits"] = clean_logits
     return _fp8_fp4_paged_mqa_logits_impl(
         q,
         kv_cache,
@@ -752,7 +778,6 @@ def fp8_fp4_paged_mqa_logits(
         block_tables,
         schedule_metadata,
         max_model_len,
-        clean_logits=clean_logits,
         **kwargs,
     )
 

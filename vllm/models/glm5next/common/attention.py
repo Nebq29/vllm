@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import Glm5NextTextConfig
 
+import vllm.envs as envs  # noqa: F401  (registers VLLM_GLM_INDEXER_LEGACY_FP8)
 from vllm.config import (
     CacheConfig,
     VllmConfig,
@@ -30,7 +33,10 @@ from vllm.model_executor.models.deepseek_v2 import (
     yarn_get_mscale,
 )
 from vllm.model_executor.utils import maybe_disable_graph_partition
-from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
+from vllm.models.glm5next.nvidia.ops.kpool_compress import (
+    fwht128_quant_fp8,
+    fwht128_quant_fp8_mx,
+)
 from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
@@ -379,14 +385,33 @@ class Indexer(nn.Module):
         # round-trip and bf16 matrix-rounding bias.
         assert self.head_dim == 128 and self.quant_block_size == 128
         assert self.scale_fmt == "ue8m0"
+        # SM100-class (B200 / Thor) DeepGEMM requires MX block scales on Q
+        # (per-32 UE8M0, int32-packed) and bf16 weights; the per-token Q
+        # scale can NOT be folded into weights there. SM90 keeps the legacy
+        # VLLM_GLM_INDEXER_LEGACY_FP8=1 forces the legacy path on SM100-class
+        # for quality-reference runs. Read via os.getenv so the flag works even
+        # when this file is bind-mounted over an image whose envs.py predates the
+        # fork's entry (vllm.envs.__getattr__ raises on unknown names).
+        _legacy_fp8 = os.getenv("VLLM_GLM_INDEXER_LEGACY_FP8", "0") == "1"
+        mx_sf = current_platform.is_sm100_class() and not _legacy_fp8
         q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = fwht128_quant_fp8(q)
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_head, 1)
+        if mx_sf:
+            q_fp8, q_sf = fwht128_quant_fp8_mx(q)
+            q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
+            q_sf = q_sf.view(-1, self.n_head)
+            # Kernel applies q_sf per 32-block; weights carry only the
+            # softmax / head-count constants (bf16 per the arch-10/11 gate).
+            weights = (weights * (self.softmax_scale * self.n_head**-0.5)).to(
+                torch.bfloat16
+            )
+        else:
+            q_fp8, q_scale = fwht128_quant_fp8(q)
+            q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
+            q_scale = q_scale.view(-1, self.n_head, 1)
 
-        weights = _fused_indexer_weight_scale(
-            weights, q_scale, self.softmax_scale * self.n_head**-0.5
-        )
+            weights = _fused_indexer_weight_scale(
+                weights, q_scale, self.softmax_scale * self.n_head**-0.5
+            )
 
         # kpool: per-token gate score driving the softmax-weighted pool. Computed
         # from the same hidden_states that produced `k`, so it stays token-aligned.
@@ -402,7 +427,26 @@ class Indexer(nn.Module):
             pad = 32 - self.n_head
             q_fp8 = _pad_indexer_heads(q_fp8, pad)
             weights = _pad_indexer_heads(weights, pad)
+            if mx_sf:
+                # Padded heads carry scale 0 (int32 0 = UE8M0 byte 0 -> the
+                # kernel multiplies a zero-valued fp8 row by it; weight is 0
+                # too, so the contribution is exactly zero).
+                q_sf = torch.cat(
+                    [q_sf, q_sf.new_zeros(q_sf.shape[0], pad)], dim=1
+                )
 
+        if mx_sf:
+            # Tuple form signals the MX path to forward_cuda / the indexer.
+            return self.indexer_op(
+                hidden_states,
+                (q_fp8, q_sf),
+                k,
+                weights,
+                gate_score=gate_score,
+                compress_ape=self.index_kpool_compress_ape,
+                index_kpool=self.index_kpool,
+                positions=positions,
+            )
         return self.indexer_op(
             hidden_states,
             q_fp8,

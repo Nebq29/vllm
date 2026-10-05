@@ -105,6 +105,87 @@ def _fwht_quant_kernel(
     tl.store(sout_ptr + rows, scale, mask=rmask)
 
 
+@triton.jit
+def _fwht_quant_mx_kernel(
+    q_ptr,
+    qout_ptr,
+    sf_ptr,
+    n_rows,
+    BLOCK_R: tl.constexpr,
+):
+    """Fused Hadamard-128 rotation + per-32 UE8M0 FP8 quant (SM100 MX path).
+
+    Same FWHT as ``_fwht_quant_kernel`` but quantizes each 32-element block
+    with its own power-of-two (UE8M0) scale. The four block exponents per
+    128-wide row are packed little-endian into one int32, matching
+    DeepGEMM's ``pack_ue8m0_to_int`` byte order (byte i = block i).
+    """
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_R + tl.arange(0, BLOCK_R)
+    rmask = rows < n_rows
+    offs = tl.arange(0, 128)
+    x = tl.load(
+        q_ptr + rows[:, None] * 128 + offs[None, :], mask=rmask[:, None], other=0.0
+    ).to(tl.float32)
+
+    N: tl.constexpr = BLOCK_R * 128
+    x = tl.reshape(x, (N,))
+    x = _fwht_stage(x, N, BLOCK_R * 64, 1)
+    x = _fwht_stage(x, N, BLOCK_R * 32, 2)
+    x = _fwht_stage(x, N, BLOCK_R * 16, 4)
+    x = _fwht_stage(x, N, BLOCK_R * 8, 8)
+    x = _fwht_stage(x, N, BLOCK_R * 4, 16)
+    x = _fwht_stage(x, N, BLOCK_R * 2, 32)
+    x = _fwht_stage(x, N, BLOCK_R, 64)
+    x = x * 0.08838834764831845  # 1/sqrt(128), exact in fp32
+
+    # Match the unfused path's bf16 materialization before quantizing.
+    x = x.to(tl.bfloat16).to(tl.float32)
+    x = tl.reshape(x, (BLOCK_R, 4, 32))
+
+    fp8_max = 448.0
+    absmax = tl.maximum(tl.max(tl.abs(x), axis=2), 1e-4)  # [BLOCK_R, 4]
+    e = tl.ceil(tl.log2(absmax * (1.0 / fp8_max)))  # UE8M0 exponent (fp32)
+    scale = tl.exp2(e)
+    y = tl.minimum(tl.maximum(x / scale[:, :, None], -fp8_max), fp8_max)
+    y = tl.reshape(y, (BLOCK_R, 128))
+    tl.store(qout_ptr + rows[:, None] * 128 + offs[None, :], y, mask=rmask[:, None])
+
+    # Pack 4 UE8M0 bytes (e+127) little-endian into one int32 per row.
+    sf_i = (e + 127.0).to(tl.int32)  # [BLOCK_R, 4]
+    lanes = tl.arange(0, 4)
+    packed = tl.sum(sf_i << (lanes[None, :] * 8), axis=1)  # [BLOCK_R]
+    tl.store(sf_ptr + rows, packed, mask=rmask)
+
+
+def fwht128_quant_fp8_mx(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate each 128-wide row by Hadamard-128, then MX-FP8-quant per 32.
+
+    SM100/SM110 DeepGEMM contract: Q values are float8_e4m3fn and the
+    scale factors are int32-packed UE8M0 bytes, one int32 per row covering
+    the four 32-element blocks (little-endian: byte i = block i).
+
+    Args:
+        q: ``[rows, 128]`` bf16 — one head vector per row.
+
+    Returns:
+        (q_fp8 ``[rows, 128]`` float8_e4m3fn,
+         q_sf ``[rows]`` int32 packed UE8M0 exponents).
+    """
+    assert q.ndim == 2 and q.shape[1] == 128, q.shape
+    assert q.dtype == torch.bfloat16
+    assert q.is_contiguous()
+    n_rows = q.shape[0]
+    q_fp8 = torch.empty((n_rows, 128), dtype=torch.float8_e4m3fn, device=q.device)
+    q_sf = torch.empty((n_rows,), dtype=torch.int32, device=q.device)
+    if n_rows == 0:
+        return q_fp8, q_sf
+    BLOCK_R = 32
+    grid = (triton.cdiv(n_rows, BLOCK_R),)
+    _fwht_quant_mx_kernel[grid](q, q_fp8, q_sf, n_rows, BLOCK_R=BLOCK_R, num_warps=2)
+    return q_fp8, q_sf
+
+
 def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Rotate each 128-wide row by the Hadamard-128 transform, then FP8-quant.
 
@@ -136,6 +217,29 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 @triton.jit
+def _mx_quant_vec128(x):
+    """MX-FP8-quantize a 128-element fp32 vector per 32, UE8M0 scales.
+
+    Args:
+        x: fp32 tensor reshaped ``(4, 32)`` (one 128-wide rotated vector).
+
+    Returns:
+        (y fp8 ``(4, 32)`` clamped to ±448,
+         packed int32 — four UE8M0 exponent bytes (e+127), little-endian:
+         byte i = block i, matching DeepGEMM ``pack_ue8m0_to_int``).
+    """
+    fp8_max = 448.0
+    absmax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)  # [4]
+    e = tl.ceil(tl.log2(absmax * (1.0 / fp8_max)))  # UE8M0 exponent (fp32)
+    scale = tl.exp2(e)
+    y = tl.minimum(tl.maximum(x / scale[:, None], -fp8_max), fp8_max)
+    sf_i = (e + 127.0).to(tl.int32)  # [4]
+    lanes = tl.arange(0, 4)
+    packed = tl.sum(sf_i << (lanes * 8), axis=0)  # scalar int32
+    return y.to(tl.float8e4nv), packed
+
+
+@triton.jit
 def _kpool_softmax_rotate_write_cache_kernel(
     buf_fp8_ptr,
     buf_fp32_ptr,
@@ -157,13 +261,18 @@ def _kpool_softmax_rotate_write_cache_kernel(
     HEAD_DIM: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
+    MX_SF: tl.constexpr,
     HAS_WRITE_MASK: tl.constexpr,
     RETURN_COMPRESSED: tl.constexpr,
     WRITE_CACHE: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """One program per pool. softmax(slot_score+ape)-weighted sum of slot_k ->
-    Hadamard-128 -> per-vector fp8 absmax quant -> write to cache at ``loc``."""
+    Hadamard-128 -> per-vector fp8 absmax quant -> write to cache at ``loc``.
+
+    ``buf_fp32_ptr`` is the trailing-scale view: float32 (legacy per-128
+    scale) or int32 (MX packed UE8M0) — the caller passes the view matching
+    ``MX_SF`` so the store below writes the right width."""
     row = tl.program_id(0)
     do_write = True
     if HAS_WRITE_MASK:
@@ -221,14 +330,20 @@ def _kpool_softmax_rotate_write_cache_kernel(
     # --- per-vector absmax fp8 quant ---
     fp8_max = 448.0
     fp8_max_inv = 1.0 / fp8_max
-    absmax = tl.max(tl.abs(x), axis=0)
-    absmax = tl.maximum(absmax, 1e-4)
-    if ROUND_SCALE:
-        scale = tl.exp2(tl.ceil(tl.log2(absmax * fp8_max_inv)))
+    if MX_SF:
+        # MX path: per-32 UE8M0 scales, packed int32 into the trailing 4B.
+        quantized, sf_packed = _mx_quant_vec128(tl.reshape(x, (4, 32)))
+        quantized = tl.reshape(quantized, (BLOCK_D,))
+        scale = sf_packed
     else:
-        scale = absmax * fp8_max_inv
-    quantized = x / scale
-    quantized = tl.minimum(tl.maximum(quantized, -fp8_max), fp8_max)
+        absmax = tl.max(tl.abs(x), axis=0)
+        absmax = tl.maximum(absmax, 1e-4)
+        if ROUND_SCALE:
+            scale = tl.exp2(tl.ceil(tl.log2(absmax * fp8_max_inv)))
+        else:
+            scale = absmax * fp8_max_inv
+        quantized = x / scale
+        quantized = tl.minimum(tl.maximum(quantized, -fp8_max), fp8_max)
 
     if WRITE_CACHE:
         loc = tl.load(loc_ptr + row, mask=do_write, other=0)
@@ -268,6 +383,7 @@ def kpool_compress_and_write_cache(
     round_scale: bool = True,
     return_compressed: bool = False,
     write_cache: bool = True,
+    mx_sf: bool = False,
 ):
     """Compress ``pool_size`` tokens into one fp8 K and write at ``loc``.
 
@@ -283,6 +399,8 @@ def kpool_compress_and_write_cache(
         round_scale: Round each fp8 scale down to a power of two.
         return_compressed: Also return the compressed K and scales.
         write_cache: Write the compressed result into ``kv_cache``.
+        mx_sf: MX contract — per-32 UE8M0 scales packed int32 in the
+            trailing 4 bytes instead of one fp32 scale per 128.
 
     """
     assert slot_k.ndim == 3
@@ -312,18 +430,20 @@ def kpool_compress_and_write_cache(
 
     if slot_k.shape[0] == 0:
         if return_compressed:
+            sf_dtype = torch.int32 if mx_sf else torch.float32
             return (
                 torch.empty(
                     (0, head_dim),
                     dtype=torch.float8_e4m3fn,
                     device=slot_k.device,
                 ),
-                torch.empty((0,), dtype=torch.float32, device=slot_k.device),
+                torch.empty((0,), dtype=sf_dtype, device=slot_k.device),
             )
         return None
 
     buf_fp8 = buf.view(torch.float8_e4m3fn)
-    buf_fp32 = buf.view(torch.float32)
+    # Trailing-scale view: int32 (MX packed UE8M0) or float32 (legacy).
+    buf_sf = buf.view(torch.int32) if mx_sf else buf.view(torch.float32)
     # bytes per page (last dim of kv_cache) viewed as uint8
     buf_numel_per_page = buf.stride(0)
     s_offset_nbytes_in_page = page_size * head_dim
@@ -335,15 +455,17 @@ def kpool_compress_and_write_cache(
             device=slot_k.device,
         )
         compressed_scale = torch.empty(
-            (slot_k.shape[0],), dtype=torch.float32, device=slot_k.device
+            (slot_k.shape[0],),
+            dtype=torch.int32 if mx_sf else torch.float32,
+            device=slot_k.device,
         )
     else:
         compressed_k = buf_fp8
-        compressed_scale = buf_fp32
+        compressed_scale = buf_sf
 
     _kpool_softmax_rotate_write_cache_kernel[(slot_k.shape[0],)](
         buf_fp8,
-        buf_fp32,
+        buf_sf,
         slot_k,
         slot_score,
         ape,
@@ -362,6 +484,7 @@ def kpool_compress_and_write_cache(
         HEAD_DIM=head_dim,
         S_OFFSET_NBYTES_IN_PAGE=s_offset_nbytes_in_page,
         ROUND_SCALE=round_scale,
+        MX_SF=mx_sf,
         HAS_WRITE_MASK=has_write_mask,
         RETURN_COMPRESSED=return_compressed,
         WRITE_CACHE=write_cache,
@@ -484,6 +607,7 @@ def _kpool_decode_update_batched_kernel(
     HEAD_DIM: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
+    MX_SF: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """One program per request; iterates its NEXT_N verify tokens in order.
@@ -588,12 +712,18 @@ def _kpool_decode_update_batched_kernel(
 
             fp8_max = 448.0
             fp8_max_inv = 1.0 / fp8_max
-            absmax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-4)
-            if ROUND_SCALE:
-                scale = tl.exp2(tl.ceil(tl.log2(absmax * fp8_max_inv)))
+            if MX_SF:
+                # MX path: per-32 UE8M0 scales, packed int32 into trailing 4B.
+                quantized, sf_packed = _mx_quant_vec128(tl.reshape(x, (4, 32)))
+                quantized = tl.reshape(quantized, (BLOCK_D,))
+                scale = sf_packed
             else:
-                scale = absmax * fp8_max_inv
-            quantized = tl.minimum(tl.maximum(x / scale, -fp8_max), fp8_max)
+                absmax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-4)
+                if ROUND_SCALE:
+                    scale = tl.exp2(tl.ceil(tl.log2(absmax * fp8_max_inv)))
+                else:
+                    scale = absmax * fp8_max_inv
+                quantized = tl.minimum(tl.maximum(x / scale, -fp8_max), fp8_max)
 
             loc = cache_loc.to(tl.int64)
             loc_page_index = loc // PAGE_SIZE
@@ -640,6 +770,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
     pool_size: int,
     head_dim: int = INDEX_HEAD_DIM,
     round_scale: bool = True,
+    mx_sf: bool = False,
 ) -> None:
     """Batched decode-step kpool update for spec verify (``next_n > 1``).
 
@@ -689,7 +820,8 @@ def kpool_decode_update_and_maybe_write_cache_batched(
     page_size = kv_cache.shape[1]
     buf = kv_cache
     buf_fp8 = buf.view(torch.float8_e4m3fn)
-    buf_fp32 = buf.view(torch.float32)
+    # Trailing-scale view: int32 (MX packed UE8M0) or float32 (legacy).
+    buf_sf = buf.view(torch.int32) if mx_sf else buf.view(torch.float32)
 
     # The kernel indexes the int tensors as ``req * next_n + t`` (row-major),
     # so they must be contiguous. Callers pass either a view of a contiguous
@@ -701,7 +833,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
 
     _kpool_decode_update_batched_kernel[(num_requests,)](
         buf_fp8,
-        buf_fp32,
+        buf_sf,
         tail_kv_cache,
         tail_slot_mapping,
         key,
@@ -724,6 +856,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
         HEAD_DIM=head_dim,
         S_OFFSET_NBYTES_IN_PAGE=page_size * head_dim,
         ROUND_SCALE=round_scale,
+        MX_SF=mx_sf,
         BLOCK_D=triton.next_power_of_2(head_dim),
     )
 

@@ -53,6 +53,7 @@ def _kpool_compress_insert(
     kpool: int,
     head_dim: int,
     round_scale: bool,
+    mx_sf: bool = False,
 ) -> None:
     """Pool ``kpool`` consecutive tokens into one fp8 K and write at pool slots.
 
@@ -87,6 +88,7 @@ def _kpool_compress_insert(
         round_scale=round_scale,
         write_cache=True,
         return_compressed=False,
+        mx_sf=mx_sf,
     )
 
 
@@ -171,12 +173,18 @@ def sparse_attn_indexer_kpool(
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
 
-    # q_scale is required iff the FP4 cache path is enabled; the FP8 path
-    # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.
+    # q_scale is required iff the FP4 cache path is enabled. On the MX
+    # (SM100-class) FP8 path it carries the int32-packed UE8M0 per-32
+    # scales; the legacy SM90 FP8 path folds the per-token scale into
+    # `weights` and passes None.
     if use_fp4_cache:
         assert q_scale is not None, "use_fp4_cache=True requires q_scale"
-    else:
-        assert q_scale is None, "q_scale must be None when use_fp4_cache=False"
+    mx_sf = q_scale is not None and not use_fp4_cache
+    if mx_sf:
+        assert q_scale.dtype == torch.int32, (
+            "MX FP8 indexer path requires int32-packed UE8M0 q_scale, got "
+            f"{q_scale.dtype}"
+        )
 
     # During speculative decoding, k may be padded to the CUDA graph batch
     # size while slot_mapping only covers actual tokens. Truncate k to avoid
@@ -207,6 +215,7 @@ def sparse_attn_indexer_kpool(
                     index_kpool,
                     head_dim,
                     round_scale=(scale_fmt is not None),
+                    mx_sf=mx_sf,
                 )
                 # Persist each request's incomplete prefill pool so decode can
                 # finish it, including after PD transfer. Tail slots use
@@ -228,6 +237,12 @@ def sparse_attn_indexer_kpool(
         else:
             # standard: per-token fp8 quant + scatter (all tokens).
             assert scale_fmt is not None
+            if mx_sf:
+                raise NotImplementedError(
+                    "MX FP8 indexer requires the fused kpool write path "
+                    "(index_kpool > 1); the unfused indexer_k_quant_and_cache "
+                    "op writes legacy per-128 fp32 scales."
+                )
             ops.indexer_k_quant_and_cache(
                 k,
                 kv_cache,
@@ -307,6 +322,12 @@ def sparse_attn_indexer_kpool(
             if use_fp4_cache:
                 q_slice_cast = q_slice.view(torch.int8)
                 k_quant_cast = k_quant.view(torch.int8)
+                k_scale_cast = k_scale.view(torch.int32).squeeze(-1)
+            elif mx_sf:
+                # MX FP8: values stay fp8; gathered scales are int32-packed
+                # UE8M0 (workspace holds them as (T,4) uint8).
+                q_slice_cast = q_slice
+                k_quant_cast = k_quant
                 k_scale_cast = k_scale.view(torch.int32).squeeze(-1)
             else:
                 q_slice_cast = q_slice
@@ -495,6 +516,7 @@ def sparse_attn_indexer_kpool(
                     index_kpool,
                     head_dim,
                     round_scale=(scale_fmt is not None),
+                    mx_sf=mx_sf,
                 )
         if current_platform.is_cuda_alike() and _fill_short_decode_causal_indices(
             topk_indices_buffer,
@@ -512,9 +534,24 @@ def sparse_attn_indexer_kpool(
                 padded_q_quant_decode_tokens = pack_seq_triton(
                     q_quant[:num_decode_tokens], decode_lens, pad_value=0
                 )
-                padded_q_scale = pack_seq_triton(
-                    q_scale[:num_decode_tokens], decode_lens, pad_value=0
-                )
+                if mx_sf:
+                    # int32-packed UE8M0: pack via a uint8 view (pack_seq_triton
+                    # takes float/uint8), then re-view as int32. Zero bytes ->
+                    # scale 0 on padded rows; masked out by context_lens.
+                    sf_u8 = q_scale[:num_decode_tokens].view(torch.uint8)
+                    padded_q_scale = (
+                        pack_seq_triton(sf_u8, decode_lens, pad_value=0)
+                        .view(torch.int32)
+                        .reshape(
+                            decode_lens.shape[0],
+                            -1,
+                            *q_scale.shape[1:],
+                        )
+                    )
+                else:
+                    padded_q_scale = pack_seq_triton(
+                        q_scale[:num_decode_tokens], decode_lens, pad_value=0
+                    )
             else:
                 padded_q_quant_decode_tokens = pack_seq_triton(
                     q_quant[:num_decode_tokens], decode_lens
