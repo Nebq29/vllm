@@ -166,6 +166,10 @@ class SparseIndexerTopk(torch.nn.Module):
         self._cooperative_capable = self._is_cuda and (
             current_platform.has_device_capability(90)
             and not current_platform.is_device_capability_family(120)
+            # Thor (sm_110) passes the >=90 gate but cooperative cluster
+            # launches fail there with "cluster misconfiguration"
+            # (cooperative_topk.cu:48), observed on Jetson Thor TP=2.
+            and not current_platform.is_device_capability_family(110)
         )
         self._is_rocm = current_platform.is_rocm()
         self._aiter_enabled = False
