@@ -2184,16 +2184,31 @@ def moe_align_block_size(
             expert_map,
         )
         return
-    torch.ops._moe_C.moe_align_block_size(
-        topk_ids,
-        num_experts,
-        block_size,
-        sorted_token_ids,
-        experts_ids,
-        num_tokens_post_pad,
-        expert_map,
-        scatter_idx,
-    )
+    # The thor-dsv4 base image's compiled _moe_C has the 7-arg schema
+    # (no scatter_idx). Only pass the 8th arg when one was actually
+    # requested, so this Python works against both the 7-arg (base image)
+    # and 8-arg (rebuilt) extensions. GLM never requests scatter_idx.
+    if scatter_idx is not None:
+        torch.ops._moe_C.moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_token_ids,
+            experts_ids,
+            num_tokens_post_pad,
+            expert_map,
+            scatter_idx,
+        )
+    else:
+        torch.ops._moe_C.moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_token_ids,
+            experts_ids,
+            num_tokens_post_pad,
+            expert_map,
+        )
 
 
 def batched_moe_align_block_size(

@@ -150,16 +150,31 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
-    ops.moe_align_block_size(
-        topk_ids,
-        num_experts,
-        block_size,
-        sorted_ids,
-        expert_ids,
-        num_tokens_post_pad,
-        expert_map if ignore_invalid_experts else None,
-        scatter_idx,
-    )
+    # The image's compiled _moe_C::moe_align_block_size has the 7-arg schema
+    # (no scatter_idx). Only pass the 8th arg when a scatter_idx was
+    # actually requested, so this Python works against both the 7-arg
+    # (thor-dsv4 base image) and 8-arg (rebuilt) extensions.
+    if scatter_idx is not None:
+        ops.moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            expert_map if ignore_invalid_experts else None,
+            scatter_idx,
+        )
+    else:
+        ops.moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            expert_map if ignore_invalid_experts else None,
+        )
 
     if expert_map is not None and not ignore_invalid_experts:
         expert_ids = expert_map[expert_ids]
